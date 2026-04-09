@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.codex/
+
+miniapp/node_modules/
+miniapp/dist/
+runtime/
+
+.DS_Store

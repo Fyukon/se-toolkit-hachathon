@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     postgres_password: str = "postgres"
     postgres_host: str = "db"
     postgres_port: int = 5432
+    database_url_override: str | None = None
 
     telegram_bot_token: str = "replace-me"
     telegram_webapp_url: str = "http://localhost:5173"
@@ -25,10 +26,15 @@ class Settings(BaseSettings):
     default_telegram_user_id: str = "local-dev"
 
     llm_api_key: str = "replace-me"
-    llm_model: str = "replace-me"
+    llm_model: str = "google/gemma-4-26b-a4b-it"
+    llm_base_url: str = "https://openrouter.ai/api/v1"
+    llm_site_url: str | None = None
+    llm_app_name: str = "SE Toolkit Hackathon"
 
     @property
     def database_url(self) -> str:
+        if self.database_url_override:
+            return self.database_url_override
         return (
             f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"

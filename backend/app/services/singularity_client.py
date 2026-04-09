@@ -13,6 +13,37 @@ class SingularityClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
 
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str | int | bool] | None = None,
+        json_payload: dict | None = None,
+        timeout: float = 20.0,
+    ) -> dict | list[dict]:
+        with httpx.Client(
+            base_url=settings.singularity_api_base_url,
+            headers=self._headers(),
+            timeout=timeout,
+            trust_env=False,
+        ) as client:
+            try:
+                response = client.request(method, path, params=params, json=json_payload)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.text.strip() or "SingularityApp returned an error."
+                raise SingularityAPIError(
+                    f"SingularityApp API error {exc.response.status_code}: {detail}",
+                    status_code=exc.response.status_code,
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise SingularityAPIError(f"Failed to reach SingularityApp API: {exc}") from exc
+
+            payload = response.json()
+
+        return payload
+
     def fetch_events(self) -> list[dict]:
         # Version 1 relies on tasks because SingularityApp exposes task CRUD publicly.
         return []
@@ -66,26 +97,15 @@ class SingularityClient:
         if start_date_to:
             params["startDateTo"] = start_date_to
 
-        with httpx.Client(
-            base_url=settings.singularity_api_base_url,
-            headers=self._headers(),
-            timeout=20.0,
-        ) as client:
-            try:
-                response = client.get("/v2/task", params=params)
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                detail = exc.response.text.strip() or "SingularityApp returned an error."
-                raise SingularityAPIError(
-                    f"SingularityApp API error {exc.response.status_code}: {detail}",
-                    status_code=exc.response.status_code,
-                ) from exc
-            except httpx.HTTPError as exc:
-                raise SingularityAPIError(f"Failed to reach SingularityApp API: {exc}") from exc
+        return self._request("GET", "/v2/task", params=params)
 
-            payload = response.json()
+    def create_task(self, payload: dict) -> dict:
+        result = self._request("POST", "/v2/task", json_payload=payload)
+        return result if isinstance(result, dict) else {}
 
-        return payload
+    def update_task(self, task_id: str, payload: dict) -> dict:
+        result = self._request("PATCH", f"/v2/task/{task_id}", json_payload=payload)
+        return result if isinstance(result, dict) else {}
 
     @staticmethod
     def extract_tasks(payload: list[dict] | dict) -> list[dict]:

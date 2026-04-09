@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from datetime import datetime
 from html import escape
@@ -6,8 +7,15 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, WebAppInfo
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update, WebAppInfo
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 BACKEND_URL = os.getenv("BACKEND_INTERNAL_URL", "http://backend:8000")
@@ -41,11 +49,16 @@ def build_help_text() -> str:
         "/sync - синхронизировать задачи из SingularityApp",
         "/day - показать summary на день",
         "/week - показать summary на неделю",
+        "/action <команда> - создать draft изменения",
+        "/confirm <id> - подтвердить draft и применить изменение",
+        "/cancel_action <id> - отменить draft",
         "",
         "Рекомендуемый порядок:",
         "1. /connect <token>",
         "2. /sync",
         "3. /day или /week",
+        "4. /action ...",
+        "5. /confirm <id>",
     ]
 
     if not is_https_webapp_url(WEBAPP_URL):
@@ -60,17 +73,141 @@ def build_help_text() -> str:
     return "\n".join(lines)
 
 
+def backend_candidates() -> list[str]:
+    candidates = [
+        BACKEND_URL,
+        "http://backend:8000",
+        "http://host.docker.internal:8000",
+    ]
+    unique_candidates: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        normalized = item.rstrip("/")
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique_candidates.append(normalized)
+    return unique_candidates
+
+
+def create_backend_client(base_url: str, timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=base_url.rstrip("/"),
+        timeout=timeout,
+        trust_env=False,
+    )
+
+
+def build_action_keyboard(payload: dict) -> InlineKeyboardMarkup | None:
+    action_id = payload.get("id")
+    if not action_id:
+        return None
+
+    status = payload.get("status")
+    candidates = payload.get("candidates") or []
+
+    if status == "clarification_required" and candidates:
+        rows = []
+        for index, candidate in enumerate(candidates[:5]):
+            title = (candidate.get("title") or f"Вариант {index + 1}").strip()
+            if len(title) > 48:
+                title = f"{title[:45]}..."
+            rows.append(
+                [InlineKeyboardButton(text=title, callback_data=f"pick:{action_id}:{index}")]
+            )
+        rows.append([InlineKeyboardButton(text="Отменить", callback_data=f"cancel:{action_id}")])
+        return InlineKeyboardMarkup(rows)
+
+    if status == "draft":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(text="Подтвердить", callback_data=f"confirm:{action_id}"),
+                    InlineKeyboardButton(text="Отменить", callback_data=f"cancel:{action_id}"),
+                ]
+            ]
+        )
+
+    return None
+
+
 async def backend_get(path: str, telegram_id: str) -> dict:
-    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=20.0) as client:
-        response = await client.get(path, params={"telegram_id": telegram_id})
+    last_transport_error: httpx.TransportError | None = None
+    for base_url in backend_candidates():
+        logger.info("Bot backend GET url=%s path=%s telegram_id=%s", base_url, path, telegram_id)
+        async with create_backend_client(base_url=base_url, timeout=20.0) as client:
+            try:
+                response = await client.get(path, params={"telegram_id": telegram_id})
+            except httpx.TransportError as exc:
+                last_transport_error = exc
+                logger.exception(
+                    "Bot backend GET transport failure url=%s path=%s telegram_id=%s",
+                    base_url,
+                    path,
+                    telegram_id,
+                )
+                continue
+
+            response.raise_for_status()
+            logger.info("Bot backend GET completed url=%s path=%s status=%s", base_url, path, response.status_code)
+            return response.json()
+
+    if last_transport_error is not None:
+        raise last_transport_error
+
+    async with create_backend_client(base_url=BACKEND_URL, timeout=20.0) as client:
+        try:
+            response = await client.get(path, params={"telegram_id": telegram_id})
+        except httpx.HTTPError:
+            logger.exception(
+                "Bot backend GET transport failure url=%s path=%s telegram_id=%s",
+                BACKEND_URL,
+                path,
+                telegram_id,
+            )
+            raise
         response.raise_for_status()
+        logger.info("Bot backend GET completed path=%s status=%s", path, response.status_code)
         return response.json()
 
 
 async def backend_post(path: str, payload: dict) -> dict:
-    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=30.0) as client:
-        response = await client.post(path, json=payload)
+    safe_payload = {key: ("***" if "token" in key.lower() else value) for key, value in payload.items()}
+    last_transport_error: httpx.TransportError | None = None
+    for base_url in backend_candidates():
+        logger.info("Bot backend POST url=%s path=%s payload=%s", base_url, path, safe_payload)
+        async with create_backend_client(base_url=base_url, timeout=30.0) as client:
+            try:
+                response = await client.post(path, json=payload)
+            except httpx.TransportError as exc:
+                last_transport_error = exc
+                logger.exception(
+                    "Bot backend POST transport failure url=%s path=%s payload=%s",
+                    base_url,
+                    path,
+                    safe_payload,
+                )
+                continue
+
+            response.raise_for_status()
+            logger.info("Bot backend POST completed url=%s path=%s status=%s", base_url, path, response.status_code)
+            return response.json()
+
+    if last_transport_error is not None:
+        raise last_transport_error
+
+    async with create_backend_client(base_url=BACKEND_URL, timeout=30.0) as client:
+        try:
+            response = await client.post(path, json=payload)
+        except httpx.HTTPError:
+            logger.exception(
+                "Bot backend POST transport failure url=%s path=%s payload=%s",
+                BACKEND_URL,
+                path,
+                safe_payload,
+            )
+            raise
         response.raise_for_status()
+        logger.info("Bot backend POST completed path=%s status=%s", path, response.status_code)
         return response.json()
 
 
@@ -172,6 +309,46 @@ def format_summary_message(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def format_action_message(payload: dict) -> str:
+    lines = [
+        f"<b>Action #{payload.get('id')}</b>",
+        "",
+        escape(payload.get("message") or "Результат недоступен."),
+    ]
+
+    if payload.get("intent"):
+        lines.append(f"\nИнтент: <b>{escape(payload['intent'])}</b>")
+
+    parsed = payload.get("parsed_action") or {}
+    if parsed.get("target_title"):
+        lines.append(f"Цель: <b>{escape(parsed['target_title'])}</b>")
+    elif parsed.get("title"):
+        lines.append(f"Новая задача: <b>{escape(parsed['title'])}</b>")
+
+    if parsed.get("new_when"):
+        lines.append(f"Новое время: <b>{escape(format_when(parsed['new_when']))}</b>")
+
+    validation_errors = payload.get("validation_errors") or []
+    if validation_errors:
+        lines.append("\n<b>Ошибки / замечания:</b>")
+        for item in validation_errors:
+            lines.append(f"• {escape(str(item))}")
+
+    candidates = payload.get("candidates") or []
+    if candidates:
+        lines.append("\n<b>Кандидаты:</b>")
+        for item in candidates:
+            title = escape(item.get("title") or "Без названия")
+            when = format_when(item.get("when"))
+            lines.append(f"• <b>{title}</b> — {escape(when)}")
+
+    if payload.get("status") == "draft":
+        lines.append(f"\nПодтвердить: <code>/confirm {payload.get('id')}</code>")
+        lines.append(f"Отменить: <code>/cancel_action {payload.get('id')}</code>")
+
+    return "\n".join(lines)
+
+
 def split_html_message(message: str, max_length: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     if len(message) <= max_length:
         return [message]
@@ -198,6 +375,18 @@ def split_html_message(message: str, max_length: int = TELEGRAM_MESSAGE_LIMIT) -
         chunks.append(remaining)
 
     return chunks
+
+
+async def send_action_payload(message_target, payload: dict) -> None:
+    message = format_action_message(payload)
+    keyboard = build_action_keyboard(payload)
+    chunks = split_html_message(message)
+    for index, chunk in enumerate(chunks):
+        await message_target.reply_text(
+            chunk,
+            parse_mode="HTML",
+            reply_markup=keyboard if index == 0 else None,
+        )
 
 
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -281,6 +470,121 @@ async def week(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await send_summary(update, "/summary/week")
 
 
+async def action_command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "Нужен текст команды. Пример: /action перенеси лабу DSA на завтра 15:00"
+        )
+        return
+
+    telegram_id = str(update.effective_user.id)
+    try:
+        payload = await backend_post(
+            "/actions/parse",
+            {"telegram_id": telegram_id, "text": parts[1].strip()},
+        )
+    except httpx.HTTPError as exc:
+        await update.message.reply_text(f"Не удалось создать draft: {format_http_error(exc)}")
+        return
+
+    await send_action_payload(update.message, payload)
+
+
+async def confirm_action(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await update.message.reply_text("Нужен id draft. Пример: /confirm 12")
+        return
+
+    telegram_id = str(update.effective_user.id)
+    change_request_id = parts[1].strip()
+    try:
+        payload = await backend_post(
+            f"/actions/{change_request_id}/confirm",
+            {"telegram_id": telegram_id},
+        )
+    except httpx.HTTPError as exc:
+        await update.message.reply_text(f"Не удалось применить draft: {format_http_error(exc)}")
+        return
+
+    await send_action_payload(update.message, payload)
+
+
+async def cancel_action_command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await update.message.reply_text("Нужен id draft. Пример: /cancel_action 12")
+        return
+
+    telegram_id = str(update.effective_user.id)
+    change_request_id = parts[1].strip()
+    try:
+        payload = await backend_post(
+            f"/actions/{change_request_id}/cancel",
+            {"telegram_id": telegram_id},
+        )
+    except httpx.HTTPError as exc:
+        await update.message.reply_text(f"Не удалось отменить draft: {format_http_error(exc)}")
+        return
+
+    await send_action_payload(update.message, payload)
+
+
+async def handle_action_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user is None or query.message is None:
+        return
+
+    await query.answer()
+    parts = (query.data or "").split(":")
+    if len(parts) < 2:
+        return
+
+    action_name = parts[0]
+    change_request_id = parts[1]
+    telegram_id = str(query.from_user.id)
+
+    try:
+        if action_name == "pick" and len(parts) == 3:
+            payload = await backend_post(
+                f"/actions/{change_request_id}/select-candidate",
+                {"telegram_id": telegram_id, "candidate_index": int(parts[2])},
+            )
+        elif action_name == "confirm":
+            payload = await backend_post(
+                f"/actions/{change_request_id}/confirm",
+                {"telegram_id": telegram_id},
+            )
+        elif action_name == "cancel":
+            payload = await backend_post(
+                f"/actions/{change_request_id}/cancel",
+                {"telegram_id": telegram_id},
+            )
+        else:
+            await query.answer("Неизвестное действие.", show_alert=True)
+            return
+    except httpx.HTTPError as exc:
+        await query.message.reply_text(f"Не удалось выполнить действие: {format_http_error(exc)}")
+        return
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        logger.exception("Failed to clear inline keyboard for action callback")
+
+    await send_action_payload(query.message, payload)
+
+
 async def send_summary(update: Update, path: str) -> None:
     if update.message is None or update.effective_user is None:
         return
@@ -303,6 +607,15 @@ async def send_summary(update: Update, path: str) -> None:
         )
 
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Telegram bot error", exc_info=context.error)
+
+    if isinstance(update, Update) and update.message is not None:
+        await update.message.reply_text(
+            "Во время обработки команды произошла ошибка. Попробуй повторить ещё раз или проверь логи backend/bot."
+        )
+
+
 async def idle_mode() -> None:
     while True:
         print("Telegram bot token is not configured. Bot is running in idle mode.", flush=True)
@@ -317,10 +630,16 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("sync", sync))
     application.add_handler(CommandHandler("day", day))
     application.add_handler(CommandHandler("week", week))
+    application.add_handler(CommandHandler("action", action_command))
+    application.add_handler(CommandHandler("confirm", confirm_action))
+    application.add_handler(CommandHandler("cancel_action", cancel_action_command))
+    application.add_handler(CallbackQueryHandler(handle_action_callback, pattern=r"^(pick|confirm|cancel):"))
+    application.add_error_handler(handle_error)
     return application
 
 
 def main() -> None:
+    logger.info("Bot startup backend_candidates=%s webapp_url=%s", backend_candidates(), WEBAPP_URL)
     if not BOT_TOKEN or BOT_TOKEN == "replace-me" or BOT_TOKEN == "NO":
         asyncio.run(idle_mode())
         return

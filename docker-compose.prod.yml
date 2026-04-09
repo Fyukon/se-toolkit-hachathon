@@ -6,8 +6,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-se_toolkit}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -20,11 +18,10 @@ services:
     build:
       context: ./backend
     restart: unless-stopped
-    network_mode: host
     env_file:
       - .env
-    volumes:
-      - ./runtime:/app/runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
@@ -40,8 +37,6 @@ services:
     profiles: ["manual-init"]
     env_file:
       - .env
-    volumes:
-      - ./runtime:/app/runtime
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -53,11 +48,10 @@ services:
     build:
       context: ./bot
     restart: unless-stopped
-    network_mode: host
     env_file:
       - .env
-    environment:
-      BACKEND_INTERNAL_URL: ${BOT_BACKEND_INTERNAL_URL:-http://127.0.0.1:8000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       backend:
         condition: service_healthy
@@ -65,13 +59,35 @@ services:
   miniapp:
     build:
       context: ./miniapp
+      dockerfile: Dockerfile.prod
     restart: unless-stopped
-    network_mode: host
     env_file:
       - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       backend:
         condition: service_healthy
 
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+      miniapp:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file:
+      - .env
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
 volumes:
   postgres_data:
+  caddy_data:
+  caddy_config:

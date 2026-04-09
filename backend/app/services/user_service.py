@@ -3,9 +3,6 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.user import User
-from app.services.singularity_client import SingularityClient
-
-
 class UserService:
     """Fetches and upserts the single-user or Telegram-bound user profile."""
 
@@ -29,12 +26,10 @@ class UserService:
     def connect(self, telegram_id: str | None, token: str | None, timezone: str) -> User:
         resolved_id = self.resolve_telegram_id(telegram_id)
         user = self.get_by_telegram_id(resolved_id)
-        resolved_token = token or user.singularity_access_token or settings.singularity_api_token
+        resolved_token = token or (user.singularity_access_token if user else None) or settings.singularity_api_token
 
         if not resolved_token:
             raise ValueError("SingularityApp API token is required for Version 1.")
-
-        SingularityClient(resolved_token).validate_token()
 
         if user is None:
             user = User(telegram_id=resolved_id, timezone=timezone)

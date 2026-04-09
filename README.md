@@ -22,10 +22,32 @@ Implemented:
 
 Not implemented yet:
 
-- Natural language changes to the schedule.
-- Confirmation flow for write actions.
 - Real LLM-generated summary text.
 - Rich parsing of every SingularityApp entity beyond tasks.
+- Full-fledged LLM parser instead of the current deterministic Version 2 parser.
+
+## Version 2 current backend scope
+
+The repository now includes an initial Version 2 action pipeline:
+
+- `POST /actions/parse` — convert a natural-language command into a draft
+- `GET /actions/{id}` — inspect a draft
+- `POST /actions/{id}/confirm` — apply a confirmed draft to SingularityApp
+- `POST /actions/{id}/cancel` — cancel a draft
+
+Currently supported action intents:
+
+- `move_task`
+- `create_task`
+- `complete_task`
+
+The parser now supports an OpenRouter-backed LLM parse step with deterministic fallback. The confirmation and apply flow stays backend-controlled.
+
+Recommended LLM setup:
+
+- `LLM_API_KEY=<OpenRouter API key>`
+- `LLM_MODEL=google/gemma-4-26b-a4b-it`
+- `LLM_BASE_URL=https://openrouter.ai/api/v1`
 
 ## SingularityApp token
 
@@ -46,11 +68,61 @@ According to SingularityApp documentation, API tokens are created in the account
 docker compose up --build
 ```
 
+If you start with a fresh PostgreSQL volume, initialize the schema once:
+
+```bash
+docker compose run --rm --profile manual-init backend-init
+```
+
+If `backend` resolves `db` but still gets `connection timeout expired`, your Docker bridge network is likely broken on the host. In that case:
+
+1. set `POSTGRES_HOST=host.docker.internal` in `.env`
+2. restart the stack
+
+If Telegram bot cannot reach backend and shows `Server disconnected without sending a response`, use the same workaround for bot -> backend:
+
+```env
+BACKEND_INTERNAL_URL=http://host.docker.internal:8000
+```
+
+If that still does not work locally, use a file-backed SQLite override for development:
+
+```env
+DATABASE_URL_OVERRIDE=sqlite+pysqlite:////app/runtime/local.db
+```
+
+Then restart the stack and initialize the schema once:
+
+```bash
+docker compose up --build
+docker compose run --rm --profile manual-init backend-init
+```
+
 Services:
 
 - Backend API: `http://localhost:8000`
 - Swagger: `http://localhost:8000/docs`
 - Mini App dev server: `http://localhost:5173`
+
+## Production / VDS
+
+For a server deployment use [`docker-compose.prod.yml`](/home/alex/PycharmProjects/se-toolkit-hachathon/docker-compose.prod.yml).
+
+Production stack:
+
+- `db` — PostgreSQL
+- `backend` — FastAPI
+- `backend-init` — database initialization
+- `bot` — Telegram bot
+- `miniapp` — static frontend served by nginx
+- `caddy` — HTTPS reverse proxy
+
+The production proxy serves:
+
+- `https://your-domain.example/` -> Mini App
+- `https://your-domain.example/api/*` -> backend
+
+Detailed VDS instructions are in [`docs/VDS_DEPLOY_RU.md`](/home/alex/PycharmProjects/se-toolkit-hachathon/docs/VDS_DEPLOY_RU.md).
 
 ## Main API flow
 
@@ -93,6 +165,9 @@ After you set a real `TELEGRAM_BOT_TOKEN`, the bot supports:
 - `/sync`
 - `/day`
 - `/week`
+- `/action <command>`
+- `/confirm <id>`
+- `/cancel_action <id>`
 
 It also sends a keyboard button that opens the Mini App URL from `TELEGRAM_WEBAPP_URL`.
 
